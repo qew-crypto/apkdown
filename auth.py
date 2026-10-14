@@ -1,8 +1,17 @@
 """Owner-only Telegram login conversation. Secrets are never logged."""
 import asyncio
 import contextlib
+import re
 import time
 from telethon import errors
+
+
+def normalize_code(text):
+    """Accept 4–8 ASCII digits, plain or separated by single dots."""
+    text = text.strip()
+    if not re.fullmatch(r'(?:[0-9]{4,8}|[0-9](?:\.[0-9]){3,7})', text):
+        return None
+    return text.replace('.', '')
 
 
 class BotLogin:
@@ -87,13 +96,14 @@ class BotLogin:
                 sent = await self.user.send_code_request(text)
                 self.phone, self.code_hash = text, sent.phone_code_hash
                 self.stage = 'code'
-                await event.respond('Код запрошен. Отправьте полученный код. Не запрашивайте новые коды многократно.')
+                await event.respond('Код запрошен. Отправьте код через точки, например 1.2.3.5 (это 1235), или обычными цифрами. Не запрашивайте новые коды многократно.')
             elif self.stage == 'code':
-                if not text.isdigit() or not 4 <= len(text) <= 8:
-                    await event.respond('Ожидается числовой код или /cancel.')
+                code = normalize_code(text)
+                if code is None:
+                    await event.respond('Введите 4–8 цифр: 1.2.3.5 или 1235. /cancel — отмена.')
                     return True
                 try:
-                    await self.user.sign_in(phone=self.phone, code=text, phone_code_hash=self.code_hash)
+                    await self.user.sign_in(phone=self.phone, code=code, phone_code_hash=self.code_hash)
                 except errors.SessionPasswordNeededError:
                     self.stage = 'password'
                     await event.respond('Включена 2FA. Отправьте облачный пароль или /cancel.')
