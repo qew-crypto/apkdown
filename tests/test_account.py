@@ -86,10 +86,17 @@ class AccountTests(unittest.IsolatedAsyncioTestCase):
         self.account.client.is_user_authorized.return_value=False
         with self.assertRaises(RuleError):await self.account.prepare(-1001,123)
 
-    async def test_logged_out_session_not_reused(self):
-        self.account.client.log_out.return_value=True
-        await self.account.logout(123)
-        self.assertTrue(self.account.disabled)
+    async def test_logged_out_session_reset_for_in_bot_login(self):
+        previous=self.account.client
+        previous.log_out.return_value=True
+        fresh=AsyncMock()
+        fresh.is_connected=Mock(return_value=True)
+        fresh.is_user_authorized.return_value=False
+        with patch.object(self.account,'make_client',Mock(return_value=fresh)):
+            await self.account.logout(123)
+        self.assertFalse(self.account.disabled)
+        self.assertIs(self.account.client,fresh)
+        previous.disconnect.assert_awaited_once()
         with self.assertRaises(RuleError):await self.account.verified()
 
     async def test_other_moderator_cannot_use_account_button(self):

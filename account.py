@@ -23,10 +23,20 @@ class AccountAccess:
         self.owner_id=owner_id
         directory=base/'sessions'
         directory.mkdir(mode=0o700,exist_ok=True)
-        self.client=TelegramClient(str(directory/'join_account'),api_id,api_hash,
-            flood_sleep_threshold=0,receive_updates=False,request_retries=0)
+        self.api_id,self.api_hash=api_id,api_hash
+        self.path=str(directory/'join_account')
+        self.client=self.make_client()
         self.lock=asyncio.Lock()
         self.confirmations={}
+        self.disabled=False
+
+    def make_client(self):
+        return TelegramClient(self.path,self.api_id,self.api_hash,
+            flood_sleep_threshold=0,receive_updates=False,request_retries=0)
+
+    async def reset_client(self):
+        await self.client.disconnect()
+        self.client=self.make_client()
         self.disabled=False
 
     @classmethod
@@ -48,14 +58,14 @@ class AccountAccess:
 
     async def connected(self):
         if self.disabled:
-            raise RuleError('Сессия отозвана. Остановите бот, выполните account_login.py и перезапустите бот.')
+            raise RuleError('Сессия отозвана. Выполните /account_login в личке.')
         if not self.client.is_connected():
             await self.client.connect()
 
     async def verified(self):
         await self.connected()
         if not await self.client.is_user_authorized():
-            raise RuleError('Аккаунт не подключён. Остановите бот, выполните python account_login.py локально и запустите бот снова.')
+            raise RuleError('Аккаунт не подключён. Выполните /account_login в личке бота.')
         me=await self.client.get_me()
         if not me or me.bot or me.id!=self.owner_id:
             raise RuleError('ID личной сессии не совпадает с ACCOUNT_OWNER_ID. Операция запрещена.')
@@ -122,6 +132,7 @@ class AccountAccess:
             self.disabled=True
             if not result:
                 raise RuleError('Telegram не подтвердил отзыв. Завершите сессию вручную в разделе «Устройства».')
+            await self.reset_client()
 
     async def close(self):
         self.confirmations.clear()

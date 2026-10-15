@@ -9,12 +9,13 @@ from pathlib import Path
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramRetryAfter
-from aiogram.filters import Command
+from aiogram.filters import Command, Filter
 from aiogram.types import (ChatPermissions, Message, ChatJoinRequest, CallbackQuery,
                            InlineKeyboardMarkup, InlineKeyboardButton)
 from dotenv import load_dotenv
 from telethon import errors as user_errors
 from account import AccountAccess
+from account_chat import AccountChatLogin
 
 from core import Store, SpamGuard, RuleError, ROLES, duration, can_assign, has_link
 
@@ -30,6 +31,7 @@ bot_username = ''
 bulk_tasks = {}
 command_times = {}
 account = None
+account_login_ui = None
 user_jobs = set()
 
 HELP = '''ChatGuard — модерация и автоприём
@@ -54,7 +56,8 @@ HELP = '''ChatGuard — модерация и автоприём
 
 Настройки (4+):
 /panel — панель заявок с кнопками\n/settings — текущие настройки
-/account_login — инструкция локального входа
+/account_login — вход по номеру, коду и 2FA в личке
+/account_cancel — отменить вход
 /account_status — проверить аккаунт (только владелец, в личке)
 /account_logout yes — отозвать личную сессию
 /links on|off — удаление ссылок и @упоминаний
@@ -135,10 +138,22 @@ async def safe_delete(message):
         return False
 
 
+class AccountInputFilter(Filter):
+    async def __call__(self,message: Message):
+        return account_login_ui is not None and account_login_ui.expects(message)
+
+
+# Registered before all commands so a password beginning with / is not treated
+# as a moderation command. Only four explicit account-control commands bypass it.
+@router.message(AccountInputFilter())
+async def account_input(message: Message):
+    await account_login_ui.receive(message)
+
+
 COMMANDS = ['start','help','roles','myrole','warn','unwarn','warns','mute','unmute',
             'ban','unban','del','role','settings','links','ads','spam','autojoin',
             'warnlimit','adword','trigger','triggers','log','panel',
-            'account_login','account_status','account_logout']
+            'account_login','account_status','account_logout','account_cancel']
 
 
 @router.message(Command(*COMMANDS))
@@ -148,7 +163,7 @@ async def commands(message: Message):
         return
     now = asyncio.get_running_loop().time()
     throttle = (message.chat.id,message.from_user.id)
-    if now-command_times.get(throttle,0)<1:
+    if now-command_times.get(throttle,0)<1 and not (message.text or '').startswith('/account_cancel'):
         return
     command_times[throttle]=now
     token, _, args = (message.text or '').partition(' ')
@@ -168,13 +183,16 @@ async def commands(message: Message):
                 raise RuleError('Заполните API_ID, API_HASH, ACCOUNT_OWNER_ID в .env и перезапустите бот.')
             account.owner(message.from_user.id)
             if command=='account_login':
-                await message.answer('На своём компьютере/сервере: остановите бот, выполните python account_login.py, затем python bot.py. Номер, код и 2FA вводите только в терминале, не здесь.')
+                await account_login_ui.begin(message)
+            elif command=='account_cancel':
+                await account_login_ui.cancel(message)
             elif command=='account_status':
                 async with account.lock:
                     await account.verified()
                 await message.answer('Личная сессия подключена. ID совпадает с ACCOUNT_OWNER_ID.')
             elif args=='yes':
                 await account.logout(message.from_user.id)
+                account_login_ui.clear()
                 await message.answer('Личная сессия отозвана. Обычная модерация и Bot API автоприём продолжают работать.')
             else:
                 await message.answer('Подтвердите отзыв сессии: /account_logout yes')
@@ -607,7 +625,7 @@ async def moderate(message: Message):
 
 
 async def main():
-    global bot,store,bot_username,account
+    global bot,store,bot_username,account,account_login_ui
     os.umask(0o077)
     load_dotenv(BASE/'.env')
     token = os.getenv('BOT_TOKEN','').strip()
@@ -616,16 +634,26 @@ async def main():
     data = BASE/'data'
     data.mkdir(mode=0o700,exist_ok=True)
     account=AccountAccess.from_env(BASE)
+    account_login_ui=AccountChatLogin(account) if account is not None else None
+    expiry_task=None
     store = Store(data/'chatguard.db')
     bot = Bot(token)
     dp = Dispatcher()
     dp.include_router(router)
     try:
+        if account_login_ui is not None:
+            expiry_task=asyncio.create_task(account_login_ui.expire())
         me = await bot.get_me()
         bot_username=me.username
         print(f'@{me.username} запущен. Ctrl+C — остановка.')
         await dp.start_polling(bot,allowed_updates=dp.resolve_used_update_types())
     finally:
+        if expiry_task is not None:
+            expiry_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await expiry_task
+        if account_login_ui is not None:
+            account_login_ui.clear()
         tasks = list(bulk_tasks.values())
         for task in tasks:
             task.cancel()
