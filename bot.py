@@ -1,4 +1,4 @@
-"""ChatGuard: Telegram Bot API moderation, no personal-account sessions."""
+"""ChatGuard: moderation plus optional owner-only user-session approval."""
 import asyncio
 import contextlib
 import logging
@@ -13,6 +13,8 @@ from aiogram.filters import Command
 from aiogram.types import (ChatPermissions, Message, ChatJoinRequest, CallbackQuery,
                            InlineKeyboardMarkup, InlineKeyboardButton)
 from dotenv import load_dotenv
+from telethon import errors as user_errors
+from account import AccountAccess
 
 from core import Store, SpamGuard, RuleError, ROLES, duration, can_assign, has_link
 
@@ -27,6 +29,8 @@ trigger_times = {}
 bot_username = ''
 bulk_tasks = {}
 command_times = {}
+account = None
+user_jobs = set()
 
 HELP = '''ChatGuard — модерация и автоприём
 
@@ -50,6 +54,9 @@ HELP = '''ChatGuard — модерация и автоприём
 
 Настройки (4+):
 /panel — панель заявок с кнопками\n/settings — текущие настройки
+/account_login — инструкция локального входа
+/account_status — проверить аккаунт (только владелец, в личке)
+/account_logout yes — отозвать личную сессию
 /links on|off — удаление ссылок и @упоминаний
 /ads on|off — удаление пересылок из каналов и рекламных фраз
 /spam on|off — 6 сообщений за 8 секунд: мут 5 минут
@@ -130,7 +137,8 @@ async def safe_delete(message):
 
 COMMANDS = ['start','help','roles','myrole','warn','unwarn','warns','mute','unmute',
             'ban','unban','del','role','settings','links','ads','spam','autojoin',
-            'warnlimit','adword','trigger','triggers','log','panel']
+            'warnlimit','adword','trigger','triggers','log','panel',
+            'account_login','account_status','account_logout']
 
 
 @router.message(Command(*COMMANDS))
@@ -152,6 +160,24 @@ async def commands(message: Message):
             return
         if command=='roles':
             await message.answer('\n'.join(f'{i}: {name}' for i,name in ROLES.items()))
+            return
+        if command.startswith('account_'):
+            if message.chat.type!='private':
+                raise RuleError('Команды аккаунта доступны только в личке с ботом.')
+            if account is None:
+                raise RuleError('Заполните API_ID, API_HASH, ACCOUNT_OWNER_ID в .env и перезапустите бот.')
+            account.owner(message.from_user.id)
+            if command=='account_login':
+                await message.answer('На своём компьютере/сервере: остановите бот, выполните python account_login.py, затем python bot.py. Номер, код и 2FA вводите только в терминале, не здесь.')
+            elif command=='account_status':
+                async with account.lock:
+                    await account.verified()
+                await message.answer('Личная сессия подключена. ID совпадает с ACCOUNT_OWNER_ID.')
+            elif args=='yes':
+                await account.logout(message.from_user.id)
+                await message.answer('Личная сессия отозвана. Обычная модерация и Bot API автоприём продолжают работать.')
+            else:
+                await message.answer('Подтвердите отзыв сессии: /account_logout yes')
             return
         chat = message.chat.id
         actor = message.from_user.id
@@ -301,6 +327,11 @@ async def commands(message: Message):
                 await message.answer(f'Выполнено: {command}, пользователь {target}.')
     except RuleError as exc:
         await message.answer(str(exc))
+    except user_errors.FloodWaitError as exc:
+        await message.answer(f'Telegram просит подождать {exc.seconds} с. Не повторяйте запросы раньше.')
+    except (user_errors.RPCError,OSError,asyncio.TimeoutError) as exc:
+        LOG.warning('Ошибка личного аккаунта: %s',type(exc).__name__)
+        await message.answer('Операция аккаунта не выполнена. Проверьте сессию, права и сеть.')
     except TelegramRetryAfter as exc:
         await message.answer(f'Telegram ограничил запросы. Повторите через {exc.retry_after} с.')
     except TelegramAPIError as exc:
@@ -314,17 +345,21 @@ def panel_text(chat):
             f'Автоприём: {"включён" if cfg["autojoin"] else "выключен"}\n'
             f'Сохранённых заявок: {len(store.pending(chat))}\n'
             'Кнопка принимает только заявки, которые бот получил и сохранил. '
-            'Список старых заявок Telegram Bot API не предоставляет.')
+            'Список старых заявок Telegram Bot API не предоставляет.'
+            + ('\nДля старых заявок доступен отдельный режим личного аккаунта.' if account is not None else ''))
 
 
 def panel_markup(chat):
     enabled = store.config(chat)['autojoin']
-    return InlineKeyboardMarkup(inline_keyboard=[
+    rows = [
         [InlineKeyboardButton(text='✅ Принять все сохранённые заявки',callback_data=f'cg:all:{chat}')],
         [InlineKeyboardButton(text='⏸ Выключить автоприём' if enabled else '▶️ Включить автоприём',
                               callback_data=f'cg:{"off" if enabled else "on"}:{chat}')],
         [InlineKeyboardButton(text='🔄 Обновить',callback_data=f'cg:refresh:{chat}'),
-         InlineKeyboardButton(text='⛔ Остановить массовый приём',callback_data=f'cg:stop:{chat}')]])
+         InlineKeyboardButton(text='⛔ Остановить массовый приём',callback_data=f'cg:stop:{chat}')]]
+    if account is not None:
+        rows.append([InlineKeyboardButton(text='🗂 Старые заявки (личный аккаунт)',callback_data=f'cg:old:{chat}')])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def approve_saved(chat,user):
@@ -401,6 +436,21 @@ async def panel_click(query: CallbackQuery):
                         raise RuleError('Боту нужно право «Приглашение пользователей».')
                 store.setting(chat,'autojoin',action=='on')
                 store.log(chat,query.from_user.id,0,'autojoin',action)
+            elif action=='old':
+                if account is None:
+                    raise RuleError('Режим аккаунта не настроен в .env.')
+                account.owner(query.from_user.id)
+                if chat in bulk_tasks:
+                    raise RuleError('В этом чате уже идёт приём заявок.')
+                count,nonce = await account.prepare(chat,query.from_user.id)
+                keys=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text='✅ Подтверждаю приём ВСЕХ заявок',callback_data=f'ua:approve:{chat}:{nonce}')],
+                    [InlineKeyboardButton(text='Отмена',callback_data=f'ua:cancel:{chat}:{nonce}')]])
+                await bot.send_message(account.owner_id,
+                    f'Личный аккаунт: чат {chat}. Сейчас ожидают: {count}.\n'
+                    'Принять ВСЕ ожидающие заявки, включая старые? Будут приняты и заявки, '
+                    'поступившие до выполнения операции. Отменить уже отправленный серверу приём нельзя. '
+                    'Подтверждение действует 60 секунд.',reply_markup=keys)
             elif action=='all':
                 if chat in bulk_tasks:
                     raise RuleError('Массовый приём уже выполняется.')
@@ -408,6 +458,11 @@ async def panel_click(query: CallbackQuery):
                     raise RuleError('Сохранённых заявок нет. Старые заявки до подключения бота недоступны через Bot API.')
                 bulk_tasks[chat]=asyncio.create_task(bulk_accept(chat,query.from_user.id,query.message.chat.id))
             elif action=='stop':
+                if chat in user_jobs:
+                    if account is None:
+                        raise RuleError('Нет активного аккаунта.')
+                    account.owner(query.from_user.id)
+                    raise RuleError('Приём через аккаунт выполняется на сервере Telegram. Отправленную операцию нельзя отменить.')
                 if chat in bulk_tasks:
                     bulk_tasks[chat].cancel()
                 else:
@@ -421,9 +476,78 @@ async def panel_click(query: CallbackQuery):
     except (RuleError,ValueError) as exc:
         with contextlib.suppress(TelegramAPIError):
             await query.answer(str(exc)[:190],show_alert=True)
+    except user_errors.FloodWaitError as exc:
+        with contextlib.suppress(TelegramAPIError):
+            await query.message.answer(f'Telegram просит подождать {exc.seconds} с. Повторите позже.')
+    except (user_errors.RPCError,OSError,asyncio.TimeoutError) as exc:
+        LOG.warning('Ошибка запроса аккаунта: %s',type(exc).__name__)
+        with contextlib.suppress(TelegramAPIError):
+            await query.message.answer('Не удалось прочитать заявки аккаунта. Проверьте сессию и права.')
     except TelegramAPIError:
         with contextlib.suppress(TelegramAPIError):
             await query.answer('Не удалось проверить права или выполнить действие.',show_alert=True)
+
+
+async def accept_old_requests(chat,actor,nonce,destination):
+    try:
+        await require(chat,actor,4)
+        remaining=await account.accept_all(chat,actor,nonce)
+        store.log(chat,actor,0,'account-approve-all')
+        suffix=f'Сейчас ожидают: {remaining}.' if remaining is not None else 'Не удалось прочитать остаток заявок.'
+        await bot.send_message(destination,'Telegram подтвердил массовый приём через личный аккаунт. '+suffix+
+            ' Новые заявки могут появляться во время обработки. Локальную очередь Bot API при необходимости обновите отдельной кнопкой.')
+    except RuleError as exc:
+        with contextlib.suppress(TelegramAPIError):
+            await bot.send_message(destination,str(exc))
+    except user_errors.FloodWaitError as exc:
+        with contextlib.suppress(TelegramAPIError):
+            await bot.send_message(destination,f'Telegram просит подождать {exc.seconds} с. Запрос автоматически не повторяется.')
+    except (user_errors.RPCError,OSError,asyncio.TimeoutError) as exc:
+        LOG.warning('Приём через аккаунт: %s',type(exc).__name__)
+        with contextlib.suppress(TelegramAPIError):
+            await bot.send_message(destination,'Не удалось подтвердить результат операции. Проверьте заявки в Telegram перед повтором: сервер мог уже принять их.')
+    except TelegramAPIError:
+        LOG.warning('Не удалось отправить результат приёма через аккаунт.')
+    finally:
+        user_jobs.discard(chat)
+        bulk_tasks.pop(chat,None)
+
+
+@router.callback_query(F.data.startswith('ua:'))
+async def account_click(query: CallbackQuery):
+    try:
+        if account is None:
+            raise RuleError('Режим аккаунта не настроен.')
+        account.owner(query.from_user.id)
+        if not query.message or query.message.chat.type!='private':
+            raise RuleError('Подтверждение работает только в личке владельца.')
+        _,action,chat_id,nonce=query.data.split(':')
+        chat=int(chat_id)
+        await require(chat,query.from_user.id,4)
+        async with locks[chat]:
+            if action=='cancel':
+                async with account.lock:
+                    pending=account.confirmations.get(chat)
+                    if pending and pending[0]==nonce:
+                        account.confirmations.pop(chat,None)
+                await query.answer('Подтверждение отменено.')
+            elif action=='approve':
+                if chat in bulk_tasks:
+                    raise RuleError('Для этого чата уже идёт обработка.')
+                # The job revalidates the nonce and account/chat permissions.
+                await query.answer('Проверяю подтверждение и отправляю запрос…')
+                user_jobs.add(chat)
+                bulk_tasks[chat]=asyncio.create_task(accept_old_requests(chat,query.from_user.id,nonce,query.from_user.id))
+            else:
+                raise RuleError('Неизвестная кнопка.')
+            with contextlib.suppress(TelegramAPIError):
+                await query.message.edit_reply_markup(reply_markup=None)
+    except (RuleError,ValueError) as exc:
+        with contextlib.suppress(TelegramAPIError):
+            await query.answer(str(exc)[:190],show_alert=True)
+    except TelegramAPIError:
+        with contextlib.suppress(TelegramAPIError):
+            await query.answer('Не удалось проверить права. Повторите позже.',show_alert=True)
 
 
 @router.chat_join_request()
@@ -483,7 +607,7 @@ async def moderate(message: Message):
 
 
 async def main():
-    global bot,store,bot_username
+    global bot,store,bot_username,account
     os.umask(0o077)
     load_dotenv(BASE/'.env')
     token = os.getenv('BOT_TOKEN','').strip()
@@ -491,6 +615,7 @@ async def main():
         raise SystemExit('Укажите BOT_TOKEN в .env.')
     data = BASE/'data'
     data.mkdir(mode=0o700,exist_ok=True)
+    account=AccountAccess.from_env(BASE)
     store = Store(data/'chatguard.db')
     bot = Bot(token)
     dp = Dispatcher()
@@ -505,6 +630,8 @@ async def main():
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks,return_exceptions=True)
+        if account is not None:
+            await account.close()
         await bot.session.close()
         store.close()
 
