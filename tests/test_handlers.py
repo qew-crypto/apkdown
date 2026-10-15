@@ -90,7 +90,7 @@ class Handlers(unittest.IsolatedAsyncioTestCase):
     async def test_bulk_accepts_all_saved_requests(self):
         self.store.save_request(-1,456);self.store.save_request(-1,789)
         self.bot.send_message=AsyncMock()
-        with patch.object(app,'require',AsyncMock(return_value=5)),patch.object(app.asyncio,'sleep',AsyncMock()):
+        with patch.object(app,'require_join_admin',AsyncMock()),patch.object(app.asyncio,'sleep',AsyncMock()):
             await app.bulk_accept(-1,123,123)
         self.assertEqual(self.store.pending(-1),[])
         self.assertEqual(self.bot.approve_chat_join_request.await_count,2)
@@ -126,3 +126,51 @@ class Handlers(unittest.IsolatedAsyncioTestCase):
             for _ in range(6):
                 await app.moderate(self.media('текст'))
             mute.assert_awaited_once_with(-1,456,300)
+
+    async def test_invite_admin_gets_panel_access_without_role_assignment(self):
+        self.bot.get_chat_member.return_value=NS(status='administrator',can_invite_users=True)
+        await app.require_join_admin(-1,123)
+        self.assertEqual(self.store.rank(-1,123),0)
+        with self.assertRaises(RuleError):
+            await app.require(-1,123,4)
+
+    async def test_admin_without_invite_permission_denied(self):
+        self.bot.get_chat_member.return_value=NS(status='administrator',can_invite_users=False)
+        with self.assertRaises(RuleError):
+            await app.require_join_admin(-1,123)
+
+    async def test_chat_creator_has_join_authority(self):
+        self.bot.get_chat_member.return_value=NS(status='creator')
+        await app.require_join_admin(-1,123)
+
+    async def test_internal_role4_still_has_join_authority(self):
+        self.store.set_rank(-1,123,4)
+        self.bot.get_chat_member.return_value=NS(status='member')
+        await app.require_join_admin(-1,123)
+
+    async def test_former_role4_cannot_use_panel(self):
+        self.store.set_rank(-1,123,4)
+        self.bot.get_chat_member.return_value=NS(status='left')
+        with self.assertRaises(RuleError):
+            await app.require_join_admin(-1,123)
+
+    async def test_private_panel_for_real_invite_admin(self):
+        self.bot.get_chat_member.return_value=NS(status='administrator',can_invite_users=True)
+        message=NS(text='/panel -1003744604840',from_user=NS(id=123),sender_chat=None,
+                   chat=NS(id=123,type='private'),answer=AsyncMock())
+        with patch.object(app,'command_times',{}):
+            await app.commands(message)
+        message.answer.assert_awaited_once()
+        self.assertIn('-1003744604840',message.answer.await_args.args[0])
+        self.assertIn('reply_markup',message.answer.await_args.kwargs)
+        self.assertEqual(self.store.rank(-1003744604840,123),0)
+
+    async def test_invite_admin_can_switch_autojoin_not_other_settings(self):
+        self.bot.get_chat_member.return_value=NS(status='administrator',can_invite_users=True)
+        message=NS(text='/autojoin -1003744604840 off',from_user=NS(id=123),sender_chat=None,
+                   chat=NS(id=123,type='private'),answer=AsyncMock())
+        with patch.object(app,'command_times',{}):
+            await app.commands(message)
+        self.assertFalse(self.store.config(-1003744604840)['autojoin'])
+        with self.assertRaises(RuleError):
+            await app.require(-1003744604840,123,4)

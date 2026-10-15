@@ -72,7 +72,8 @@ HELP = '''ChatGuard — модерация и автоприём
 
 Триггер совпадает со всем текстом без учёта регистра.
 В личке: /panel -100ID, /autojoin -100ID on|off, /settings -100ID
-(создатель или назначенная роль 4 в этом чате).
+(панель и автоприём: создатель, роль 4 либо Telegram-админ с правом приглашения).
+/settings и остальные настройки — только роль 4+/создатель.
 Бот должен быть администратором с нужными правами.
 '''
 
@@ -96,6 +97,23 @@ async def require(chat, user, minimum):
     if value < minimum:
         raise RuleError(f'Нужна роль {minimum}+ ({ROLES[minimum]}).')
     return value
+
+
+async def require_join_admin(chat,user):
+    """Narrow join-request authority, never a grant of internal bot role 4."""
+    member=await bot.get_chat_member(chat,user)
+    state=status(member)
+    if state=='creator':
+        return
+    present=state in ('administrator','member') or (
+        state=='restricted' and getattr(member,'is_member',False))
+    if present and store.rank(chat,user)>=4:
+        return
+    if state=='administrator' and getattr(member,'can_invite_users',False):
+        return
+    raise RuleError('Нет доступа к заявкам. Нужны права администратора Telegram '
+                    '«Приглашение пользователей», роль создателя или внутренняя роль 4. '
+                    'Проверьте также ID чата и отправляйте команду от личного аккаунта.')
 
 
 async def guard_target(chat, actor, target, minimum):
@@ -211,7 +229,7 @@ async def commands(message: Message):
                 raise RuleError('Нужен отрицательный ID группы или канала.')
         async with locks[chat]:
             if command=='panel':
-                await require(chat,actor,4)
+                await require_join_admin(chat,actor)
                 await message.answer(panel_text(chat),reply_markup=panel_markup(chat))
             elif command=='myrole':
                 r = await rank(chat,actor)
@@ -221,7 +239,10 @@ async def commands(message: Message):
                 cfg = store.config(chat)
                 await message.answer(f'Чат {chat}\n'+'\n'.join(f'{k}: {v}' for k,v in cfg.items()))
             elif command in ('links','ads','spam','autojoin'):
-                await require(chat,actor,4)
+                if command=='autojoin':
+                    await require_join_admin(chat,actor)
+                else:
+                    await require(chat,actor,4)
                 if args.lower() not in ('on','off'):
                     raise RuleError(f'Используйте /{command} on|off.')
                 if command=='autojoin' and args.lower()=='on':
@@ -414,7 +435,7 @@ async def bulk_accept(chat,actor,destination):
         await bot.send_message(destination,f'Принимаю сохранённые заявки: {len(users)}. Остановка — кнопкой в панели.')
         for i,user in enumerate(users):
             if i%10==0:
-                await require(chat,actor,4)
+                await require_join_admin(chat,actor)
             if await approve_saved(chat,user):
                 accepted += 1
             else:
@@ -440,7 +461,7 @@ async def panel_click(query: CallbackQuery):
     try:
         _,action,value = query.data.split(':')
         chat = int(value)
-        await require(chat,query.from_user.id,4)
+        await require_join_admin(chat,query.from_user.id)
         if not query.message:
             raise RuleError('Откройте новую панель: /panel.')
         # Acknowledge first: bulk work never blocks Telegram's callback deadline.
@@ -508,7 +529,7 @@ async def panel_click(query: CallbackQuery):
 
 async def accept_old_requests(chat,actor,nonce,destination):
     try:
-        await require(chat,actor,4)
+        await require_join_admin(chat,actor)
         remaining=await account.accept_all(chat,actor,nonce)
         store.log(chat,actor,0,'account-approve-all')
         suffix=f'Сейчас ожидают: {remaining}.' if remaining is not None else 'Не удалось прочитать остаток заявок.'
@@ -541,7 +562,7 @@ async def account_click(query: CallbackQuery):
             raise RuleError('Подтверждение работает только в личке владельца.')
         _,action,chat_id,nonce=query.data.split(':')
         chat=int(chat_id)
-        await require(chat,query.from_user.id,4)
+        await require_join_admin(chat,query.from_user.id)
         async with locks[chat]:
             if action=='cancel':
                 async with account.lock:
