@@ -1,8 +1,11 @@
 .env
 .venv/
+data/
 __pycache__/
 *.pyc
+*.db*
+*.zip
+# Old project secrets must never be committed either.
 sessions/
 downloads/
 *.session*
-*.zip

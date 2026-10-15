@@ -1,276 +1,522 @@
-"""Private Telegram-account downloader -> Filebin. Python 3.11+."""
+"""ChatGuard: Telegram Bot API moderation, no personal-account sessions."""
 import asyncio
 import contextlib
-import hashlib
 import logging
 import os
-import secrets
-import shutil
-import tempfile
-import time
-from dataclasses import dataclass, field
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import quote
 
-import aiohttp
-from telethon import TelegramClient, events, errors
-from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument
+from aiogram import Bot, Dispatcher, Router, F
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramRetryAfter
+from aiogram.filters import Command
+from aiogram.types import (ChatPermissions, Message, ChatJoinRequest, CallbackQuery,
+                           InlineKeyboardMarkup, InlineKeyboardButton)
+from dotenv import load_dotenv
 
-from common import BASE, config, human_bytes, safe_name
-from auth import BotLogin
+from core import Store, SpamGuard, RuleError, ROLES, duration, can_assign, has_link
 
-LOG = logging.getLogger('apkdown')
-FILEBIN = 'https://filebin.net'
+BASE = Path(__file__).resolve().parent
+router = Router()
+LOG = logging.getLogger('chatguard')
+store = None
+bot = None
+locks = defaultdict(asyncio.Lock)
+spam = SpamGuard()
+trigger_times = {}
+bot_username = ''
+bulk_tasks = {}
+command_times = {}
+
+HELP = '''ChatGuard — модерация и автоприём
+
+5 ролей: 1 помощник, 2 модератор, 3 старший модератор,
+4 администратор бота, 5 создатель чата (автоматически).
+0 — обычный участник.
+
+Наказания — ответом на сообщение или с числовым ID:
+/warn [ID] [причина] — варн (роль 1+)
+/unwarn [ID] — снять один варн (1+)
+/warns [ID] — число варнов (1+)
+/mute [ID] [10m|2h|7d] [причина] — мут (2+, по умолчанию 1h)
+/unmute [ID] — снять мут (2+)
+/ban [ID] [причина] — постоянный бан (3+)
+/unban [ID] — разрешить вернуться (3+)
+/del — удалить сообщение в ответе (2+)
+/role [ID] N — назначить роль 0–4 (4+, только ниже своей)
+/myrole — своя роль
+/roles — список ролей
+/log — последние 10 действий (2+)
+
+Настройки (4+):
+/panel — панель заявок с кнопками\n/settings — текущие настройки
+/links on|off — удаление ссылок и @упоминаний
+/ads on|off — удаление пересылок из каналов и рекламных фраз
+/spam on|off — 6 сообщений за 8 секунд: мут 5 минут
+/autojoin on|off — автоматический приём заявок
+/warnlimit 3 — лимит варнов (1–20), затем мут 24 часа
+/adword add фраза | /adword del фраза | /adword list
+/trigger add фраза | ответ
+/trigger del фраза
+/triggers — список триггеров
+
+Триггер совпадает со всем текстом без учёта регистра.
+В личке: /panel -100ID, /autojoin -100ID on|off, /settings -100ID
+(создатель или назначенная роль 4 в этом чате).
+Бот должен быть администратором с нужными правами.
+'''
 
 
-class TransferError(Exception):
-    pass
+def status(member):
+    return getattr(member.status, 'value', member.status)
 
 
-@dataclass
-class Progress:
-    stage: str = 'Скачивание из Telegram'
-    done: int = 0
-    total: int = 0
-    previous: int = 0
-    tick: float = field(default_factory=time.monotonic)
-
-    def reset(self, stage, total):
-        self.stage, self.total = stage, total
-        self.done = self.previous = 0
-        self.tick = time.monotonic()
-
-    def text(self, name):
-        now = time.monotonic()
-        speed = max(0, self.done - self.previous) / max(now - self.tick, 0.001)
-        self.previous, self.tick = self.done, now
-        percent = f'{min(100, self.done / self.total * 100):.1f}%' if self.total else 'размер неизвестен'
-        suffix = '\nОтправлено; ожидаю ответ сервера.' if self.stage.startswith('Загрузка') and self.done == self.total else ''
-        return (f'{self.stage}\n{name}\n'
-                f'{human_bytes(self.done)} / {human_bytes(self.total)} ({percent})\n'
-                f'Скорость: {human_bytes(speed)}/с{suffix}')
+async def rank(chat, user):
+    # Always consult Telegram before granting creator authority; never stored as role 5.
+    member = await bot.get_chat_member(chat, user)
+    if status(member)=='creator':
+        return 5
+    if status(member) in ('member','administrator') or (status(member)=='restricted' and getattr(member,'is_member',False)):
+        return store.rank(chat,user)
+    return 0
 
 
-async def edit_status(message, text):
+async def require(chat, user, minimum):
+    value = await rank(chat,user)
+    if value < minimum:
+        raise RuleError(f'Нужна роль {minimum}+ ({ROLES[minimum]}).')
+    return value
+
+
+async def guard_target(chat, actor, target, minimum):
+    if target <= 0 or target == actor:
+        raise RuleError('Нельзя применять эту команду к себе или к неверному ID.')
+    actor_rank = await require(chat,actor,minimum)
+    member = await bot.get_chat_member(chat,target)
+    target_rank = 5 if status(member)=='creator' else store.rank(chat,target)
+    if target_rank >= actor_rank:
+        raise RuleError('Нельзя воздействовать на равную или старшую роль.')
+    if status(member) in ('creator','administrator'):
+        raise RuleError('Администратора Telegram бот не наказывает. Сначала снимите его права вручную.')
+    return actor_rank, target_rank
+
+
+def target_args(message, args):
+    if message.reply_to_message:
+        reply = message.reply_to_message
+        if reply.sender_chat or not reply.from_user:
+            raise RuleError('Нельзя выбрать анонимного автора или канал. Укажите числовой ID пользователя.')
+        return reply.from_user.id, args
+    parts = args.split(maxsplit=1)
+    if not parts or not parts[0].isdigit():
+        raise RuleError('Ответьте на сообщение пользователя или укажите его числовой ID.')
+    return int(parts[0]), parts[1] if len(parts)>1 else ''
+
+
+async def mute(chat, user, seconds):
+    await bot.restrict_chat_member(chat,user,permissions=ChatPermissions(can_send_messages=False),
+        until_date=datetime.now(timezone.utc)+timedelta(seconds=seconds),
+        use_independent_chat_permissions=True)
+
+
+async def safe_delete(message):
     try:
-        await message.edit(text, parse_mode=None, link_preview=False)
-    except errors.MessageNotModifiedError:
-        pass
-    except errors.FloodWaitError as exc:
-        # Respect Telegram's requested delay; final message is also sent separately.
-        await asyncio.sleep(exc.seconds)
-    except errors.RPCError:
-        LOG.warning('Не удалось обновить сообщение о прогрессе.')
+        await message.delete()
+        return True
+    except TelegramAPIError:
+        LOG.warning('Удаление не выполнено: chat=%s. Проверьте права и лимиты.',message.chat.id)
+        return False
 
 
-async def report(message, progress, name):
-    while True:
-        await asyncio.sleep(5)
-        await edit_status(message, progress.text(name))
+COMMANDS = ['start','help','roles','myrole','warn','unwarn','warns','mute','unmute',
+            'ban','unban','del','role','settings','links','ads','spam','autojoin',
+            'warnlimit','adword','trigger','triggers','log','panel']
 
 
-async def upload_file(path, progress, base_url=FILEBIN):
-    """Stream without loading the whole file into RAM; redirects intentionally disabled."""
-    size = path.stat().st_size
-    bin_id = secrets.token_hex(16)
-    url = f'{base_url}/{bin_id}/{quote(path.name, safe="")}'
-    digest = hashlib.sha256()
-    progress.reset('Загрузка на Filebin', size)
+@router.message(Command(*COMMANDS))
+async def commands(message: Message):
+    if not message.from_user or message.sender_chat:
+        await message.answer('Отправьте команду от личного аккаунта, не анонимно.')
+        return
+    now = asyncio.get_running_loop().time()
+    throttle = (message.chat.id,message.from_user.id)
+    if now-command_times.get(throttle,0)<1:
+        return
+    command_times[throttle]=now
+    token, _, args = (message.text or '').partition(' ')
+    command = token.split('@')[0][1:].lower()
+    args = args.strip()
+    try:
+        if command in ('start','help'):
+            await message.answer(HELP)
+            return
+        if command=='roles':
+            await message.answer('\n'.join(f'{i}: {name}' for i,name in ROLES.items()))
+            return
+        chat = message.chat.id
+        actor = message.from_user.id
+        if message.chat.type == 'private':
+            if command not in ('autojoin','settings','panel'):
+                raise RuleError('Эта команда работает в группе/супергруппе. См. /help.')
+            pieces = args.split(maxsplit=1)
+            if not pieces or not pieces[0].lstrip('-').isdigit():
+                raise RuleError('В личке: /panel -100ID, /autojoin -100ID on|off или /settings -100ID.')
+            chat = int(pieces[0])
+            args = pieces[1] if len(pieces)>1 else ''
+            if chat >= 0:
+                raise RuleError('Нужен отрицательный ID группы или канала.')
+        async with locks[chat]:
+            if command=='panel':
+                await require(chat,actor,4)
+                await message.answer(panel_text(chat),reply_markup=panel_markup(chat))
+            elif command=='myrole':
+                r = await rank(chat,actor)
+                await message.answer(f'Ваша роль: {r} — {ROLES[r]}.')
+            elif command=='settings':
+                await require(chat,actor,4)
+                cfg = store.config(chat)
+                await message.answer(f'Чат {chat}\n'+'\n'.join(f'{k}: {v}' for k,v in cfg.items()))
+            elif command in ('links','ads','spam','autojoin'):
+                await require(chat,actor,4)
+                if args.lower() not in ('on','off'):
+                    raise RuleError(f'Используйте /{command} on|off.')
+                if command=='autojoin' and args.lower()=='on':
+                    me = await bot.get_me()
+                    member = await bot.get_chat_member(chat,me.id)
+                    if not getattr(member,'can_invite_users',False):
+                        raise RuleError('Боту нужны права администратора «Приглашение пользователей».')
+                store.setting(chat,command,args.lower()=='on')
+                store.log(chat,actor,0,command,args)
+                await message.answer(f'{command}: {args.lower()} (чат {chat}).')
+            elif command=='warnlimit':
+                await require(chat,actor,4)
+                if not args.isdigit() or not 1 <= int(args) <= 20:
+                    raise RuleError('Лимит варнов: число от 1 до 20.')
+                store.setting(chat,'warn_limit',int(args))
+                store.log(chat,actor,0,command,args)
+                await message.answer('Лимит варнов обновлён.')
+            elif command=='adword':
+                await require(chat,actor,4)
+                op, _, phrase = args.partition(' ')
+                words = list(store.config(chat)['adwords'])
+                phrase = phrase.strip().casefold()
+                if op=='list':
+                    await message.answer(('Рекламные фразы:\n'+'\n'.join(words))[:4000] if words else 'Список фраз пуст.')
+                    return
+                if op not in ('add','del') or not 2 <= len(phrase) <= 100:
+                    raise RuleError('/adword add фраза или /adword del фраза (2–100 символов).')
+                if op=='add' and phrase not in words:
+                    if len(words)>=100:
+                        raise RuleError('Максимум 100 рекламных фраз.')
+                    words.append(phrase)
+                elif op=='del' and phrase in words:
+                    words.remove(phrase)
+                store.setting(chat,'adwords',words)
+                store.log(chat,actor,0,command,op)
+                await message.answer('Список рекламных фраз обновлён.')
+            elif command in ('trigger','triggers'):
+                await require(chat,actor,4)
+                if command=='triggers':
+                    items = store.triggers(chat)
+                    await message.answer(('Триггеры:\n'+'\n'.join(p for p,_ in items))[:4000] if items else 'Триггеров нет.')
+                    return
+                op, _, rest = args.partition(' ')
+                if op=='add' and '|' in rest:
+                    phrase,answer = (v.strip() for v in rest.split('|',1))
+                    if len(store.triggers(chat))>=100 and store.answer(chat,phrase) is None:
+                        raise RuleError('Максимум 100 триггеров.')
+                    store.trigger(chat,phrase,answer)
+                elif op=='del':
+                    store.trigger(chat,rest,None)
+                else:
+                    raise RuleError('/trigger add фраза | ответ или /trigger del фраза')
+                store.log(chat,actor,0,'trigger',op)
+                await message.answer('Триггер обновлён.')
+            elif command=='log':
+                await require(chat,actor,2)
+                rows = store.logs(chat)
+                await message.answer(('Последние действия:\n'+'\n'.join(f'{a} → {t}: {c} {r}' for a,t,c,r in rows))[:4000] if rows else 'Журнал пуст.')
+            elif command=='del':
+                target, _ = target_args(message,args)
+                await guard_target(chat,actor,target,2)
+                if not message.reply_to_message:
+                    raise RuleError('/del применяется ответом на сообщение.')
+                if not await safe_delete(message.reply_to_message):
+                    raise RuleError('Не удалось удалить сообщение. Проверьте права бота.')
+                store.log(chat,actor,target,'delete')
+                await message.answer('Сообщение удалено.')
+            elif command=='role':
+                target, rest = target_args(message,args)
+                actor_rank = await require(chat,actor,4)
+                target_rank = await rank(chat,target)
+                if not rest.isdigit() or not can_assign(actor_rank,target_rank,int(rest)) or actor==target:
+                    raise RuleError('Роль: 0–4. Менять можно только младшие роли, назначать — ниже своей. Себе нельзя.')
+                store.set_rank(chat,target,int(rest))
+                store.log(chat,actor,target,'role',rest)
+                await message.answer(f'{target}: роль {rest} — {ROLES[int(rest)]}.')
+            elif command=='warns':
+                target,_ = target_args(message,args)
+                await require(chat,actor,1)
+                await message.answer(f'{target}: {store.warns(chat,target)} варнов.')
+            else:
+                minimum = 3 if command in ('ban','unban') else 1 if command in ('warn','unwarn') else 2
+                target,rest = target_args(message,args)
+                await guard_target(chat,actor,target,minimum)
+                if command=='ban':
+                    await bot.ban_chat_member(chat,target)
+                elif command=='unban':
+                    await bot.unban_chat_member(chat,target,only_if_banned=True)
+                elif command=='mute':
+                    pieces = rest.split(maxsplit=1)
+                    seconds = duration(pieces[0]) if pieces else 3600
+                    await mute(chat,target,seconds)
+                elif command=='unmute':
+                    current = await bot.get_chat(chat)
+                    if not current.permissions:
+                        raise RuleError('Не удалось узнать обычные разрешения чата.')
+                    await bot.restrict_chat_member(chat,target,permissions=current.permissions,
+                                                  use_independent_chat_permissions=True)
+                elif command=='warn':
+                    n = store.warn(chat,target)
+                    store.log(chat,actor,target,'warn',rest)
+                    limit = store.config(chat)['warn_limit']
+                    if n>=limit:
+                        try:
+                            await mute(chat,target,86400)
+                        except TelegramAPIError:
+                            await message.answer(f'Варн сохранён ({n}/{limit}), но мут не выполнен. Проверьте права бота.')
+                            return
+                        store.clear_warns(chat,target)
+                        store.log(chat,actor,target,'warn-limit-mute','24h')
+                        await message.answer(f'{target}: лимит варнов достигнут, мут 24 часа. Варны сброшены.')
+                    else:
+                        await message.answer(f'{target}: варн {n}/{limit}. {rest[:500]}')
+                    return
+                elif command=='unwarn':
+                    n = store.warn(chat,target,-1)
+                    store.log(chat,actor,target,'unwarn')
+                    await message.answer(f'{target}: осталось варнов — {n}.')
+                    return
+                store.log(chat,actor,target,command,rest)
+                await message.answer(f'Выполнено: {command}, пользователь {target}.')
+    except RuleError as exc:
+        await message.answer(str(exc))
+    except TelegramRetryAfter as exc:
+        await message.answer(f'Telegram ограничил запросы. Повторите через {exc.retry_after} с.')
+    except TelegramAPIError as exc:
+        LOG.warning('Команда не выполнена: %s',type(exc).__name__)
+        await message.answer('Telegram отклонил действие. Проверьте права бота, тип чата, ID и доступность участника.')
 
-    async def chunks():
-        with path.open('rb') as source:
-            while True:
-                chunk = await asyncio.to_thread(source.read, 512 * 1024)
-                if not chunk:
-                    break
-                digest.update(chunk)
-                yield chunk
-                progress.done += len(chunk)
 
-    timeout = aiohttp.ClientTimeout(total=None, connect=60, sock_read=300)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(
-            url, data=chunks(), allow_redirects=False,
-            headers={'Content-Type': 'application/octet-stream',
-                     'Content-Length': str(size), 'Accept': 'application/json',
-                     'User-Agent': 'apkdown/1.0'},
-        ) as response:
-            if response.status != 201:
-                reasons = {400: 'Некорректный файл или имя.', 403: 'Filebin отклонил файл или его расширение.',
-                           405: 'Хранилище недоступно для записи.', 411: 'Сервер не принял размер файла.',
-                           413: 'Превышен лимит размера Filebin.', 429: 'Слишком много запросов.',
-                           507: 'На Filebin закончилось место.'}
-                raise TransferError(f'Filebin HTTP {response.status}. ' + reasons.get(response.status, 'Попробуйте позже.'))
+def panel_text(chat):
+    cfg = store.config(chat)
+    return (f'Заявки: чат {chat}\n'
+            f'Автоприём: {"включён" if cfg["autojoin"] else "выключен"}\n'
+            f'Сохранённых заявок: {len(store.pending(chat))}\n'
+            'Кнопка принимает только заявки, которые бот получил и сохранил. '
+            'Список старых заявок Telegram Bot API не предоставляет.')
+
+
+def panel_markup(chat):
+    enabled = store.config(chat)['autojoin']
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='✅ Принять все сохранённые заявки',callback_data=f'cg:all:{chat}')],
+        [InlineKeyboardButton(text='⏸ Выключить автоприём' if enabled else '▶️ Включить автоприём',
+                              callback_data=f'cg:{"off" if enabled else "on"}:{chat}')],
+        [InlineKeyboardButton(text='🔄 Обновить',callback_data=f'cg:refresh:{chat}'),
+         InlineKeyboardButton(text='⛔ Остановить массовый приём',callback_data=f'cg:stop:{chat}')]])
+
+
+async def approve_saved(chat,user):
+    # Return True on accepted/already member; preserve failed requests for retry.
+    for attempt in range(2):
+        try:
+            await bot.approve_chat_join_request(chat,user)
+            store.drop_request(chat,user)
+            store.log(chat,0,user,'approve')
+            return True
+        except TelegramRetryAfter as exc:
+            if attempt == 0:
+                await asyncio.sleep(exc.retry_after)
+                continue
+            return False
+        except TelegramBadRequest:
+            with contextlib.suppress(TelegramAPIError):
+                member = await bot.get_chat_member(chat,user)
+                if status(member) in ('member','administrator','creator','kicked') or (
+                        status(member)=='restricted' and getattr(member,'is_member',False)):
+                    store.drop_request(chat,user)
+                    return True
+            return False
+        except TelegramAPIError:
+            return False
+    return False
+
+
+async def bulk_accept(chat,actor,destination):
+    accepted = failed = 0
+    try:
+        # Fixed snapshot: incoming requests while this job runs are a future batch.
+        users = store.pending(chat)
+        await bot.send_message(destination,f'Принимаю сохранённые заявки: {len(users)}. Остановка — кнопкой в панели.')
+        for i,user in enumerate(users):
+            if i%10==0:
+                await require(chat,actor,4)
+            if await approve_saved(chat,user):
+                accepted += 1
+            else:
+                failed += 1
+            await asyncio.sleep(0.15)
+        await bot.send_message(destination,
+            f'Обработка завершена. Принято/уже в чате: {accepted}. Не обработано: {failed}. '
+            'Необработанные заявки сохранены для повторной попытки.')
+    except asyncio.CancelledError:
+        with contextlib.suppress(TelegramAPIError):
+            await bot.send_message(destination,f'Массовый приём остановлен. Обработано: {accepted}. Остальные заявки сохранены.')
+        raise
+    except (TelegramAPIError,RuleError) as exc:
+        LOG.warning('Массовый приём остановлен: %s',type(exc).__name__)
+        with contextlib.suppress(TelegramAPIError):
+            await bot.send_message(destination,'Массовый приём остановлен: проверьте доступ к чату и права администратора.')
+    finally:
+        bulk_tasks.pop(chat,None)
+
+
+@router.callback_query(F.data.startswith('cg:'))
+async def panel_click(query: CallbackQuery):
+    try:
+        _,action,value = query.data.split(':')
+        chat = int(value)
+        await require(chat,query.from_user.id,4)
+        if not query.message:
+            raise RuleError('Откройте новую панель: /panel.')
+        # Acknowledge first: bulk work never blocks Telegram's callback deadline.
+        await query.answer()
+        async with locks[chat]:
+            if action in ('on','off'):
+                if action=='on':
+                    me = await bot.get_me()
+                    member = await bot.get_chat_member(chat,me.id)
+                    if not getattr(member,'can_invite_users',False):
+                        raise RuleError('Боту нужно право «Приглашение пользователей».')
+                store.setting(chat,'autojoin',action=='on')
+                store.log(chat,query.from_user.id,0,'autojoin',action)
+            elif action=='all':
+                if chat in bulk_tasks:
+                    raise RuleError('Массовый приём уже выполняется.')
+                if not store.pending(chat):
+                    raise RuleError('Сохранённых заявок нет. Старые заявки до подключения бота недоступны через Bot API.')
+                bulk_tasks[chat]=asyncio.create_task(bulk_accept(chat,query.from_user.id,query.message.chat.id))
+            elif action=='stop':
+                if chat in bulk_tasks:
+                    bulk_tasks[chat].cancel()
+                else:
+                    raise RuleError('Массовый приём не запущен.')
+            elif action!='refresh':
+                raise RuleError('Неизвестная кнопка.')
             try:
-                payload = await response.json(content_type=None)
-            except (ValueError, aiohttp.ClientError):
-                raise TransferError('Filebin не вернул корректный JSON; загрузка не подтверждена.') from None
-    if not isinstance(payload, dict) or not isinstance(payload.get('file'), dict):
-        raise TransferError('Неожиданный ответ Filebin; загрузка не подтверждена.')
-    info = payload['file']
-    if info.get('bytes') is not None and info['bytes'] != size:
-        raise TransferError('Размер файла в ответе Filebin не совпал.')
-    if info.get('sha256') and info['sha256'].lower() != digest.hexdigest():
-        raise TransferError('Контрольная сумма Filebin не совпала.')
-    expires = (payload.get('bin') or {}).get('expired_at', 'см. на странице Filebin')
-    return f'{base_url}/{bin_id}', url, expires
+                await query.message.edit_text(panel_text(chat),reply_markup=panel_markup(chat))
+            except TelegramBadRequest:
+                pass
+    except (RuleError,ValueError) as exc:
+        with contextlib.suppress(TelegramAPIError):
+            await query.answer(str(exc)[:190],show_alert=True)
+    except TelegramAPIError:
+        with contextlib.suppress(TelegramAPIError):
+            await query.answer('Не удалось проверить права или выполнить действие.',show_alert=True)
+
+
+@router.chat_join_request()
+async def approve(request: ChatJoinRequest):
+    store.save_request(request.chat.id,request.from_user.id)
+    if store.config(request.chat.id)['autojoin']:
+        if not await approve_saved(request.chat.id,request.from_user.id):
+            LOG.warning('Заявка сохранена, но не принята: chat=%s. Проверьте права.',request.chat.id)
+
+
+@router.message()
+async def moderate(message: Message):
+    if message.chat.type not in ('group','supergroup') or not message.from_user or message.sender_chat:
+        return
+    if message.from_user.is_bot:
+        return
+    # Ignore Telegram service messages, but count photos/stickers/etc. for spam.
+    if not (message.text or message.caption or message.photo or message.video or message.animation
+            or message.document or message.sticker or message.voice or message.audio
+            or message.video_note or message.poll or message.contact or message.location or message.dice):
+        return
+    chat,user = message.chat.id,message.from_user.id
+    async with locks[chat]:
+        try:
+            trusted = store.rank(chat,user)>0
+            cfg = store.config(chat)
+            text = message.text or message.caption or ''
+            is_spam = not trusted and cfg['spam'] and spam.hit(chat,user,cfg['spam_count'],cfg['spam_window'])
+            entities = list(message.entities or [])+list(message.caption_entities or [])
+            link = not trusted and cfg['links'] and has_link(text,entities)
+            origin = message.forward_origin
+            ads = not trusted and cfg['ads'] and (getattr(origin,'type',None)=='channel' or
+                    any(word in text.casefold() for word in cfg['adwords']))
+            if is_spam or link or ads:
+                member = await bot.get_chat_member(chat,user)
+                if status(member) in ('creator','administrator'):
+                    return
+                deleted = await safe_delete(message)
+                action = 'spam' if is_spam else 'link' if link else 'ad'
+                store.log(chat,0,user,action,'deleted' if deleted else 'delete-failed')
+                if is_spam:
+                    try:
+                        await mute(chat,user,cfg['spam_mute'])
+                        store.log(chat,0,user,'spam-mute','5m')
+                    except TelegramAPIError:
+                        LOG.warning('Антиспам: мут не выполнен, chat=%s',chat)
+                return
+            answer = store.answer(chat,text)
+            if answer:
+                # Per-chat cooldown prevents a trigger from becoming a flood source.
+                now = asyncio.get_running_loop().time()
+                if now-trigger_times.get(chat,0)>=3:
+                    trigger_times[chat]=now
+                    await message.answer(answer)
+        except TelegramAPIError as exc:
+            LOG.warning('Ошибка автофильтра: %s',type(exc).__name__)
 
 
 async def main():
-    api_id, api_hash, token, max_bytes = config()
+    global bot,store,bot_username
+    os.umask(0o077)
+    load_dotenv(BASE/'.env')
+    token = os.getenv('BOT_TOKEN','').strip()
+    if not token or token.startswith('replace_'):
+        raise SystemExit('Укажите BOT_TOKEN в .env.')
+    data = BASE/'data'
+    data.mkdir(mode=0o700,exist_ok=True)
+    store = Store(data/'chatguard.db')
+    bot = Bot(token)
+    dp = Dispatcher()
+    dp.include_router(router)
     try:
-        owner_id = int(os.environ['OWNER_ID'])
-        if owner_id <= 0:
-            raise ValueError()
-    except (KeyError, ValueError):
-        raise SystemExit('Укажите свой числовой Telegram ID в OWNER_ID в .env.')
-    user = TelegramClient(str(BASE / 'sessions' / 'user'), api_id, api_hash)
-    bot = TelegramClient(str(BASE / 'sessions' / 'bot'), api_id, api_hash)
-    queue = asyncio.Queue(maxsize=3)
-    worker_task = None
-    expiry_task = None
-    try:
-        await user.connect()
-        if await user.is_user_authorized():
-            me = await user.get_me()
-            if me.bot or me.id != owner_id:
-                raise SystemExit('Сессия user не совпадает с OWNER_ID. Остановите бот и исправьте настройки.')
-        await bot.start(bot_token=token)
-        bot_me = await bot.get_me()
-        auth = BotLogin(user, owner_id)
-        expiry_task = asyncio.create_task(auth.expire())
-
-        @bot.on(events.NewMessage(incoming=True))
-        async def commands(event):
-            if not event.is_private or event.sender_id != owner_id:
-                return
-            if await auth.handle(event):
-                return
-            command = (event.raw_text or '').split('@')[0].strip()
-            if command in ('/start', '/help'):
-                await event.respond(
-                    '/login — вход по номеру, коду и 2FA. /cancel — отмена входа.\n'
-                    'После входа отправьте или перешлите файл, видео, аудио или фото.\n'
-                    'Я скачаю его через ваш аккаунт и загружу на Filebin.\n'
-                    'Прогресс обновляется каждые 5 секунд. Очередь: до 3 ожидающих файлов.\n'
-                    'Файлы доступны всем, у кого есть ссылка! Не отправляйте секретные данные.\n'
-                    'Не передавайте данные входа чужим ботам. Локальная альтернатива: login.py.\n'
-                    '/status — состояние очереди.', parse_mode=None)
-            elif command == '/status':
-                connected = await user.is_user_authorized()
-                await event.respond(f'Аккаунт подключён: {connected}. Ожидают в очереди: {queue.qsize()}.')
-            elif event.message.file and not await user.is_user_authorized():
-                await event.respond('Сначала войдите в аккаунт: /login')
-
-        # User-session IDs differ from bot-session IDs. Use the outgoing event's
-        # original user message directly, rather than looking it up by the bot ID.
-        @user.on(events.NewMessage(outgoing=True))
-        async def receive(event):
-            if not event.is_private or event.chat_id != bot_me.id:
-                return
-            if not isinstance(event.message.media, (MessageMediaPhoto, MessageMediaDocument)):
-                return
-            size = event.message.file.size or 0
-            if size > max_bytes:
-                await bot.send_message(owner_id, f'Файл превышает настроенный лимит {human_bytes(max_bytes)}.')
-                return
-            if queue.full():
-                await bot.send_message(owner_id, 'Очередь заполнена. Повторите отправку позже.')
-                return
-            status = await bot.send_message(owner_id, 'Файл принят. Ожидание в очереди…')
-            try:
-                queue.put_nowait((event.message, status))
-            except asyncio.QueueFull:
-                await edit_status(status, 'Очередь заполнена. Повторите отправку позже.')
-
-        async def worker():
-            while True:
-                message, status = await queue.get()
-                folder = None
-                reporter = None
-                name = safe_name(message.file.name or f'telegram_{message.id}{message.file.ext or ".bin"}')
-                progress = Progress(total=message.file.size or 0)
-                try:
-                    folder = Path(tempfile.mkdtemp(prefix='job-', dir=BASE / 'downloads'))
-                    required = progress.total or max_bytes
-                    if shutil.disk_usage(folder).free < required + 100 * 1024 * 1024:
-                        raise TransferError('Недостаточно свободного места на диске.')
-                    await edit_status(status, progress.text(name))
-                    reporter = asyncio.create_task(report(status, progress, name))
-
-                    def downloaded(done, total):
-                        progress.done, progress.total = done, total
-                        if done > max_bytes:
-                            raise TransferError('Превышен настроенный лимит размера.')
-
-                    result = await user.download_media(message, file=str(folder / name), progress_callback=downloaded)
-                    if not result:
-                        raise TransferError('Telegram не вернул файл.')
-                    path = Path(result)
-                    if message.file.size and path.stat().st_size != message.file.size:
-                        raise TransferError('Файл из Telegram скачан не полностью.')
-                    progress.reset('Загрузка на Filebin', path.stat().st_size)
-                    await edit_status(status, progress.text(name))
-                    bin_url, file_url, expires = await upload_file(path, progress)
-                    text = (f'Готово: {name}\nРазмер: {human_bytes(path.stat().st_size)}\n'
-                            f'Страница: {bin_url}\nФайл: {file_url}\n'
-                            f'Срок хранения (ответ сервера): {expires}\n'
-                            'Ссылка не защищена паролем; хранение временное.')
-                except asyncio.CancelledError:
-                    raise
-                except TransferError as exc:
-                    text = f'Не удалось обработать {name}: {exc}'
-                except Exception as exc:
-                    # Don't print API credentials, session details or raw server responses.
-                    LOG.error('Transfer failed (%s)', type(exc).__name__)
-                    text = f'Ошибка обработки {name} ({type(exc).__name__}). Повторите отправку позже.'
-                finally:
-                    if reporter:
-                        reporter.cancel()
-                        with contextlib.suppress(asyncio.CancelledError):
-                            await reporter
-                    if folder:
-                        await asyncio.to_thread(shutil.rmtree, folder, True)
-                    queue.task_done()
-                await edit_status(status, text)
-                # Separate final message also provides a notification after long jobs.
-                try:
-                    await bot.send_message(owner_id, text, parse_mode=None, link_preview=False)
-                except errors.RPCError:
-                    LOG.warning('Не удалось отправить итоговое уведомление.')
-
-        (BASE / 'downloads').mkdir(mode=0o700, exist_ok=True)
-        worker_task = asyncio.create_task(worker())
-        print(f'Запущен @{bot_me.username}. Владелец: {owner_id}. Ctrl+C — остановка.')
-        # Stop rather than silently continue if either Telegram connection is lost.
-        done, pending = await asyncio.wait(
-            [asyncio.ensure_future(user.disconnected),
-             asyncio.create_task(bot.run_until_disconnected()), worker_task],
-            return_when=asyncio.FIRST_COMPLETED)
-        for task in pending:
-            task.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
-        for task in done:
-            task.result()
+        me = await bot.get_me()
+        bot_username=me.username
+        print(f'@{me.username} запущен. Ctrl+C — остановка.')
+        await dp.start_polling(bot,allowed_updates=dp.resolve_used_update_types())
     finally:
-        if expiry_task:
-            expiry_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await expiry_task
-        if worker_task:
-            worker_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await worker_task
-        await bot.disconnect()
-        await user.disconnect()
+        tasks = list(bulk_tasks.values())
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks,return_exceptions=True)
+        await bot.session.close()
+        store.close()
 
 
-if __name__ == '__main__':
-    logging.basicConfig(level=logging.WARNING, format='%(levelname)s: %(message)s')
+if __name__=='__main__':
+    logging.basicConfig(level=logging.WARNING,format='%(levelname)s: %(message)s')
+    # Avoid HTTP logs that could include Bot API URLs containing the token.
+    logging.getLogger('aiohttp').setLevel(logging.ERROR)
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print('\nОстановлен.')
+        pass
     except Exception as exc:
-        print(f'Ошибка запуска ({type(exc).__name__}). Проверьте .env, сеть и сессию Telegram.')
+        print(f'Ошибка запуска ({type(exc).__name__}). Проверьте токен, сеть и отсутствие второго экземпляра.')
         raise SystemExit(1)
