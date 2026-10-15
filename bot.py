@@ -527,6 +527,22 @@ async def panel_click(query: CallbackQuery):
             await query.answer('Не удалось проверить права или выполнить действие.',show_alert=True)
 
 
+def account_rpc_diagnostic(exc):
+    # Only allow-listed structural data; str(exc) may include a request payload.
+    name=type(exc).__name__
+    code=getattr(exc,'code',None)
+    label=f'{name} (RPC {code})' if isinstance(code,int) else name
+    if name=='HideRequesterMissingError':
+        detail='Telegram сообщает, что заявка отсутствует или уже обработана.'
+    elif name in ('ChatAdminRequiredError','ChatWriteForbiddenError','ChannelPrivateError'):
+        detail='Проверьте доступ личного аккаунта к чату и право приглашать пользователей.'
+    elif isinstance(exc,user_errors.ServerError):
+        detail='Внутренняя ошибка на стороне Telegram; повторять немедленно не стоит.'
+    else:
+        detail='Telegram отклонил запрос либо не подтвердил результат.'
+    return f'{label}. {detail}'
+
+
 async def accept_old_requests(chat,actor,nonce,destination):
     try:
         await require_join_admin(chat,actor)
@@ -541,10 +557,19 @@ async def accept_old_requests(chat,actor,nonce,destination):
     except user_errors.FloodWaitError as exc:
         with contextlib.suppress(TelegramAPIError):
             await bot.send_message(destination,f'Telegram просит подождать {exc.seconds} с. Запрос автоматически не повторяется.')
-    except (user_errors.RPCError,OSError,asyncio.TimeoutError) as exc:
+    except user_errors.RPCError as exc:
         LOG.warning('Приём через аккаунт: %s',type(exc).__name__)
         with contextlib.suppress(TelegramAPIError):
-            await bot.send_message(destination,'Не удалось подтвердить результат операции. Проверьте заявки в Telegram перед повтором: сервер мог уже принять их.')
+            await bot.send_message(destination,account_rpc_diagnostic(exc)+
+                '\nЗапрос не повторяется автоматически. Сначала проверьте заявки в Telegram: сервер мог уже выполнить приём. '
+                'Если заявки остались, повторите позже через новую кнопку подтверждения.')
+    except (ValueError,OSError,asyncio.TimeoutError) as exc:
+        LOG.warning('Результат приёма не подтверждён: %s',type(exc).__name__)
+        with contextlib.suppress(TelegramAPIError):
+            await bot.send_message(destination,
+                f'Не удалось подтвердить результат ({type(exc).__name__}). '
+                'Автоповтора нет. Проверьте заявки в Telegram: сервер мог уже принять их. '
+                'Сессию удалять не нужно; если заявки остались, повторите позже с новым подтверждением.')
     except TelegramAPIError:
         LOG.warning('Не удалось отправить результат приёма через аккаунт.')
     finally:

@@ -32,7 +32,8 @@ class AccountAccess:
 
     def make_client(self):
         return TelegramClient(self.path,self.api_id,self.api_hash,
-            flood_sleep_threshold=0,receive_updates=False,request_retries=0)
+            flood_sleep_threshold=0,receive_updates=False,request_retries=0,
+            raise_last_call_error=True)
 
     async def reset_client(self):
         await self.client.disconnect()
@@ -120,7 +121,7 @@ class AccountAccess:
             await self.client(functions.messages.HideAllChatJoinRequestsRequest(peer=peer,approved=True))
             try:
                 return await self.count(peer)
-            except (errors.RPCError,OSError,asyncio.TimeoutError):
+            except (errors.RPCError,OSError,asyncio.TimeoutError,ValueError):
                 return None  # Approval succeeded, but the following count is unavailable.
 
     async def logout(self,actor):
